@@ -1,119 +1,94 @@
 # PowerInterface - RSPS Network Analysis Tool
 
-PowerInterface is a GUI-based application for monitoring, capturing, editing, and resending network packets associated with RuneScape Private Servers (RSPS). This tool is designed to help security engineers identify potential vulnerabilities and ensure the integrity of server-client communications.
+A GUI application for monitoring, capturing, and manipulating network packets for RuneScape Private Servers.
 
 ## Features
 
-- **Process Selection**: Scan and select running RSPS processes
-- **Packet Capture**: Monitor and display network traffic in real-time
-- **Packet Analysis**: Inspect packet details and structure
-- **Packet Editing**: Modify packet data and resend to the server
-- **Filtering**: Filter packets based on various criteria
-- **Export**: Save captured packets to PCAP files
+- Real-time packet capture for RSPS clients
+- Packet inspection and analysis
+- Packet modification and replay
+- Support for both Windows and WSL environments
+- Filter packets using BPF-style expressions
+- Save captures to PCAP format
 
-## Requirements
+## Prerequisites
 
-- Python 3.x
-- Administrator/root privileges (required for packet capture)
-- Operating systems: Windows, macOS, Linux
+- Python 3.6 or higher
+- For WSL users:
+  - An X server (e.g., VcXsrv, Xming)
+  - WSL2 recommended
 
-## Installation
+## Quick Start
 
-1. Clone this repository or download the source code:
+1. Clone the repository:
    ```bash
    git clone https://github.com/yourusername/PowerInterface.git
    cd PowerInterface
    ```
 
-2. Set up a Python virtual environment:
-
-   **Windows:**
+2. Make the setup script executable:
    ```bash
-   python -m venv venv
-   venv\Scripts\activate
+   chmod +x setup.sh
    ```
 
-   **Linux/macOS:**
+3. Run the setup script:
+   ```bash
+   ./setup.sh
+   ```
+
+4. Run PowerInterface:
+   ```bash
+   source venv/bin/activate
+   python power_interface.py
+   ```
+
+## WSL Setup Notes
+
+If running in WSL, ensure you have:
+1. An X server installed and running on Windows
+2. The DISPLAY environment variable set correctly
+3. Proper permissions for packet capture (run with sudo)
+
+Example WSL run command:
+```bash
+sudo python power_interface.py
+```
+
+## Manual Setup
+
+If you prefer to set up manually:
+
+1. Create a virtual environment:
    ```bash
    python3 -m venv venv
    source venv/bin/activate
    ```
 
-3. Install the required dependencies:
+2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-4. Install system dependencies (Linux/Ubuntu only):
-   ```bash
-   sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtwebengine python3-pyqt5.qtwebchannel
-   sudo apt-get install -y libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
-   ```
-
 ## Usage
 
-1. Activate the virtual environment (if not already activated):
-
-   **Windows:**
-   ```bash
-   venv\Scripts\activate
-   ```
-
-   **Linux/macOS:**
-   ```bash
-   source venv/bin/activate
-   ```
-
-2. Run the application with administrator/root privileges:
-
-   **Windows:**
-   Right-click on command prompt or PowerShell and select "Run as administrator", then:
-   ```bash
-   python power_interface.py
-   ```
-
-   **Linux/macOS:**
-   ```bash
-   sudo venv/bin/python power_interface.py
-   ```
-
-   **WSL Users:**
-   If using Windows Subsystem for Linux, make sure you have an X server (like VcXsrv) running and set:
-   ```bash
-   export DISPLAY=:0
-   sudo venv/bin/python power_interface.py
-   ```
-
-3. Select a running RSPS process from the dropdown menu.
-
-4. Click "Start Capture" to begin monitoring network packets.
-
-5. Use the packet table to view captured packets and their details.
-
-6. Select a packet to view its details or edit its content.
-
-7. Modify packet data in the "Packet Editor" tab and click "Apply Changes" to update.
-
-8. Use the "Resend Packet" button to send modified packets back to the server.
+1. Launch PowerInterface
+2. Select your RSPS client process from the dropdown
+3. Click "Start Capture" to begin capturing packets
+4. Use the filter box to filter packets (e.g., "tcp.port == 43594")
+5. Click on packets to view details and hex dump
+6. Use the Packet Editor tab to modify and resend packets
 
 ## Troubleshooting
 
-- If you get an "externally-managed-environment" error, make sure you're using a virtual environment as described in the installation steps.
-- If you encounter Qt/GUI issues on Linux:
-  - Ensure all required Qt dependencies are installed
-  - Check that you have proper X server configuration if using WSL
-  - Try running `sudo apt-get install -y qtbase5-dev qt5-qmake python3-pyqt5 libqt5gui5`
+1. **No GUI in WSL**: Ensure X server is running and DISPLAY is set
+2. **Permission Denied**: Run with sudo for packet capture
+3. **Process Not Found**: Ensure the RSPS client is running
+4. **WSL Network Issues**: Check WSL network configuration
 
-## Security Considerations
+## Contributing
 
-- This tool should only be used for legitimate security research and testing.
-- Always ensure you have permission to monitor and modify network traffic for the target application.
-- Be cautious when modifying and resending packets, as this may cause unexpected behavior in the target application.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-[Insert your chosen license here]
-
-## Disclaimer
-
-This tool is provided for educational and research purposes only. The authors are not responsible for any misuse or damage caused by this software.
+This project is licensed under the MIT License - see the LICENSE file for details.
