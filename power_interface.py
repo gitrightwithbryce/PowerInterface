@@ -26,28 +26,32 @@ from PyQt5.QtGui import QFont, QColor, QIcon
 
 # Add after imports, before the is_admin() function
 def setup_environment():
-    """Setup necessary environment variables for Qt in WSL"""
-    if not os.environ.get('DISPLAY'):
-        os.environ['DISPLAY'] = ':0'
-    
-    # Get the real user when running with sudo
-    sudo_uid = os.environ.get('SUDO_UID')
-    sudo_gid = os.environ.get('SUDO_GID')
-    real_user = os.environ.get('SUDO_USER', os.getenv('USER'))
-    
-    if not os.environ.get('XDG_RUNTIME_DIR'):
-        # Use the real user's runtime directory
-        runtime_dir = f"/run/user/{sudo_uid if sudo_uid else os.getuid()}"
-        os.environ['XDG_RUNTIME_DIR'] = runtime_dir
+    """Setup necessary environment variables for Qt"""
+    if os.name == 'nt':  # Windows
+        # Windows doesn't need special display setup
+        pass
+    else:  # Unix/Linux/WSL
+        if not os.environ.get('DISPLAY'):
+            os.environ['DISPLAY'] = ':0'
         
-        # Create and set permissions for runtime directory if it doesn't exist
-        if not os.path.exists(runtime_dir):
-            os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
-            if sudo_uid and sudo_gid:
-                os.chown(runtime_dir, int(sudo_uid), int(sudo_gid))
+        # Get the real user when running with sudo
+        sudo_uid = os.environ.get('SUDO_UID')
+        sudo_gid = os.environ.get('SUDO_GID')
+        real_user = os.environ.get('SUDO_USER', os.getenv('USER'))
+        
+        if not os.environ.get('XDG_RUNTIME_DIR'):
+            # Use the real user's runtime directory
+            runtime_dir = f"/run/user/{sudo_uid if sudo_uid else os.getuid()}"
+            os.environ['XDG_RUNTIME_DIR'] = runtime_dir
             
-    if not os.environ.get('WAYLAND_DISPLAY'):
-        os.environ['QT_QPA_PLATFORM'] = 'xcb'  # Force X11 backend
+            # Create and set permissions for runtime directory if it doesn't exist
+            if not os.path.exists(runtime_dir):
+                os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+                if sudo_uid and sudo_gid:
+                    os.chown(runtime_dir, int(sudo_uid), int(sudo_gid))
+                
+        if not os.environ.get('WAYLAND_DISPLAY'):
+            os.environ['QT_QPA_PLATFORM'] = 'xcb'  # Force X11 backend
 
 # Add this call right after the imports
 setup_environment()
@@ -86,6 +90,7 @@ except ImportError:
 class PacketCaptureThread(QThread):
     """Thread for capturing packets without blocking the GUI"""
     packet_captured = pyqtSignal(object)
+    connections_updated = pyqtSignal(list)  # Signal for updated connections
     
     def __init__(self, process_pid, filter_str=None):
         super().__init__()
@@ -95,6 +100,7 @@ class PacketCaptureThread(QThread):
         self.interfaces = []
         self.connections = []
         self.socket = None
+        self.update_timer = None
         self.update_process_connections()
         
     def update_process_connections(self):
@@ -104,63 +110,285 @@ class PacketCaptureThread(QThread):
             
         try:
             process = psutil.Process(self.process_pid)
+            old_connections = self.connections
             self.connections = process.net_connections()
+            
+            # Emit signal if connections changed
+            if set(str(c) for c in self.connections) != set(str(c) for c in old_connections):
+                self.connections_updated.emit(self.connections)
+                
+            return self.connections
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             self.connections = []
+            return []
             
     def get_filter_string(self):
         """Generate BPF filter string based on process connections"""
         filters = []
         
+        # Track all ports used by the process
+        local_ports = set()
+        remote_ports = set()
+        remote_ips = set()
+        game_ports = {43594, 43595, 43596, 43597, 43598, 443, 80}  # Common RuneScape ports
+        
         for conn in self.connections:
-            if conn.status == 'ESTABLISHED' and conn.laddr and conn.raddr:
+            if conn.laddr:
                 local_ip, local_port = conn.laddr
-                remote_ip, remote_port = conn.raddr
+                local_ports.add(local_port)
                 
-                # Create filter for this connection (both directions)
-                conn_filter = f"(host {local_ip} and host {remote_ip} and port {local_port} and port {remote_port})"
-                filters.append(conn_filter)
-                
-        return " or ".join(filters) if filters else "tcp or udp"
+                if hasattr(conn, 'raddr') and conn.raddr:
+                    remote_ip, remote_port = conn.raddr
+                    remote_ports.add(remote_port)
+                    remote_ips.add(remote_ip)
+                    
+                    # Add specific connection filter (both directions)
+                    conn_filter = f"(host {local_ip} and host {remote_ip} and port {local_port} and port {remote_port})"
+                    filters.append(conn_filter)
+                    
+                    # Add specific IP filter to catch all traffic to this IP
+                    ip_filter = f"host {remote_ip}"
+                    if ip_filter not in filters:
+                        filters.append(ip_filter)
+        
+        # Add general port filters for all found ports
+        for port in local_ports:
+            port_filter = f"port {port}"
+            if port_filter not in filters:
+                filters.append(port_filter)
+            
+        # Add common game ports
+        for port in game_ports:
+            port_filter = f"port {port}"
+            if port_filter not in filters:
+                filters.append(port_filter)
+        
+        # Also add port ranges commonly used by RuneScape
+        filters.append("(tcp portrange 43000-44000)")
+        filters.append("(udp portrange 43000-44000)")
+        
+        # Create a specific filter for the process
+        if filters:
+            return " or ".join(filters)
+        else:
+            # Very broad fallback filter
+            return "tcp or udp"
         
     def run(self):
         """Main packet capture loop"""
         self.running = True
         self.update_process_connections()
         
+        # Set up timer for auto-refreshing connections (every 5 seconds)
+        update_interval = 5  # seconds
+        last_update = time.time()
+        
         try:
-            # Use custom filter if provided, otherwise generate from connections
-            filter_str = self.filter_str if self.filter_str else self.get_filter_string()
+            print("Starting Windows native packet capture...")
             
-            def packet_callback(packet):
-                if not self.running:
-                    return True  # Return True to stop sniffing
-                if IP in packet and (TCP in packet or UDP in packet):
-                    self.packet_captured.emit(packet)
-                return False  # Continue sniffing
-            
-            # Start packet capture with error handling
+            # Try to directly use Windows raw sockets for capture
             try:
-                # Use stop_filter instead of checking self.running in callback
-                sniff(filter=filter_str, 
-                      prn=packet_callback,
-                      store=0,
-                      stop_filter=lambda _: not self.running,
-                      timeout=0.1)  # Add small timeout to make stop more responsive
+                import socket
+                import struct
+                from scapy.all import conf, Ether
+                
+                # Get the interface to use (Wi-Fi)
+                iface = None
+                for i in conf.ifaces.values():
+                    if 'Wi-Fi' in i.name or 'Wireless' in i.description:
+                        iface = i
+                        break
+                
+                if not iface:
+                    print("No Wi-Fi interface found, using default")
+                    iface = conf.iface
+                
+                print(f"Using interface: {iface.name}")
+                
+                # Create a raw socket
+                if os.name == 'nt':  # Windows
+                    # Use SOCK_RAW with public protocol
+                    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+                    # Bind to interface
+                    host = socket.gethostbyname(socket.gethostname())
+                    print(f"Binding to host: {host}")
+                    s.bind((host, 0))
+                    # Set promiscuous mode
+                    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                    s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+                    print("Socket created and promiscuous mode enabled")
+                else:
+                    # Use AF_PACKET for Linux - but we're on Windows
+                    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+                
+                print("Starting direct packet capture...")
+                self._direct_socket = s
+                
+                # Start the capture loop in a separate thread
+                def capture_loop():
+                    packet_count = 0
+                    while self.running:
+                        try:
+                            # Receive a packet (65535 is max packet size)
+                            raw_packet = s.recvfrom(65535)[0]
+                            packet_count += 1
+                            
+                            if packet_count % 20 == 0:  # Print status every 20 packets
+                                print(f"Captured {packet_count} packets so far")
+                            
+                            # Try to convert to a scapy packet for consistent processing
+                            try:
+                                if os.name == 'nt':  # Windows
+                                    ip_header = raw_packet[0:20]
+                                    ip_proto = ip_header[9]
+                                    src_ip = socket.inet_ntoa(ip_header[12:16])
+                                    dst_ip = socket.inet_ntoa(ip_header[16:20])
+                                    
+                                    from scapy.layers.inet import IP, TCP, UDP
+                                    ip_packet = IP(raw_packet)
+                                    
+                                    # Check for RuneScape ports
+                                    rs_ports = [43594, 43595, 43596, 43597, 43598, 443, 80]
+                                    if (TCP in ip_packet and 
+                                        (ip_packet[TCP].sport in rs_ports or ip_packet[TCP].dport in rs_ports)):
+                                        print(f"Found RuneScape TCP packet: {src_ip}:{ip_packet[TCP].sport} -> {dst_ip}:{ip_packet[TCP].dport}")
+                                        self.packet_captured.emit(ip_packet)
+                                    elif (UDP in ip_packet and 
+                                          (ip_packet[UDP].sport in rs_ports or ip_packet[UDP].dport in rs_ports)):
+                                        print(f"Found RuneScape UDP packet: {src_ip}:{ip_packet[UDP].sport} -> {dst_ip}:{ip_packet[UDP].dport}")
+                                        self.packet_captured.emit(ip_packet)
+                                    else:
+                                        # Still emit other packets for visibility
+                                        self.packet_captured.emit(ip_packet)
+                                else:
+                                    # For non-Windows - but we're on Windows
+                                    pass
+                            except Exception as e:
+                                print(f"Error processing packet: {e}")
+                                # If we can't convert to scapy packet, create a minimal one
+                                from scapy.layers.inet import IP, TCP, UDP, Ether
+                                try:
+                                    # Try to at least create an IP packet
+                                    packet = IP(raw_packet)
+                                    self.packet_captured.emit(packet)
+                                except:
+                                    # If all else fails, just wrap in Ether
+                                    packet = Ether(raw_packet)
+                                    self.packet_captured.emit(packet)
+                            
+                            # Auto-refresh connections periodically
+                            nonlocal last_update
+                            current_time = time.time()
+                            if current_time - last_update > update_interval:
+                                self.update_process_connections()
+                                last_update = current_time
+                                
+                        except socket.timeout:
+                            # Just continue on timeout
+                            pass
+                        except Exception as e:
+                            print(f"Error in capture loop: {e}")
+                            time.sleep(0.1)  # Sleep briefly on error
+                
+                # Set a shorter timeout to be more responsive
+                s.settimeout(0.1)
+                
+                # Start capture thread
+                import threading
+                self._capture_thread = threading.Thread(target=capture_loop)
+                self._capture_thread.daemon = True
+                self._capture_thread.start()
+                
+                # Wait for the capture thread to complete
+                while self.running and self._capture_thread.is_alive():
+                    time.sleep(0.1)
+                
+                # Clean up
+                if os.name == 'nt':
+                    s.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                s.close()
+                print("Socket closed")
+                
             except Exception as e:
-                print(f"Packet capture error: {e}")
-                # Try without filter if filter fails
-                if "Cannot compile filter" in str(e):
-                    print("Attempting capture without filter...")
-                    sniff(prn=packet_callback, 
+                print(f"Error setting up direct capture: {e}")
+                # Fall back to scapy approach
+                print("Falling back to scapy capture...")
+                
+                # Create a more specific filter for RuneScape
+                # RuneScape uses several ports; we'll target common ones
+                rs_ports = [43594, 43595, 43596, 43597, 43598, 443, 80]  # Include HTTP/HTTPS ports for web clients
+                rs_port_filters = [f"port {port}" for port in rs_ports]
+                
+                # Start with a specific RuneScape filter
+                rs_filter = " or ".join(rs_port_filters)
+                
+                # Fallback to a permissive filter that includes common gaming ports
+                fallback_filter = "tcp or udp"
+                
+                # First try with RuneScape specific filter
+                filter_str = rs_filter
+                
+                print(f"Using RuneScape filter: {filter_str}")
+                
+                def packet_callback(packet):
+                    if not self.running:
+                        return True  # Return True to stop sniffing
+                        
+                    # Auto-refresh connections periodically
+                    nonlocal last_update
+                    current_time = time.time()
+                    if current_time - last_update > update_interval:
+                        self.update_process_connections()
+                        last_update = current_time
+                    
+                    # Capture ANY packet, not just IP/TCP/UDP
+                    self.packet_captured.emit(packet)
+                    # Print some debug info for all packets
+                    print(f"DEBUG: Captured packet: {packet.summary()}")
+                    
+                    return False  # Continue sniffing
+                
+                # Try to use the Wi-Fi interface specifically
+                from scapy.all import get_windows_if_list, conf
+                wifi_interface = None
+                interfaces = get_windows_if_list()
+                for iface in interfaces:
+                    if 'Wi-Fi' in iface['name'] and iface['name'] == 'Wi-Fi':
+                        wifi_interface = iface['name']
+                        break
+                
+                if wifi_interface:
+                    print(f"Starting scapy packet capture on Wi-Fi interface: {wifi_interface}...")
+                    from scapy.all import sniff
+                    sniff(filter="port 43594 or port 43595", 
+                          prn=packet_callback,
                           store=0,
                           stop_filter=lambda _: not self.running,
-                          timeout=0.1)
+                          timeout=0.1,
+                          iface=wifi_interface,
+                          promisc=True)
+                else:
+                    print("Starting scapy packet capture on all interfaces...")
+                    from scapy.all import sniff
+                    sniff(filter=filter_str, 
+                          prn=packet_callback,
+                          store=0,
+                          stop_filter=lambda _: not self.running,
+                          timeout=0.1,
+                          promisc=True)
                     
         except Exception as e:
             print(f"Capture thread error: {e}")
         finally:
             self.running = False
+            # Clean up any sockets
+            if hasattr(self, '_direct_socket'):
+                try:
+                    if os.name == 'nt':
+                        self._direct_socket.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                    self._direct_socket.close()
+                except:
+                    pass
             
     def stop(self):
         """Stop the packet capture thread"""
@@ -183,58 +411,90 @@ class PacketManager:
     def add_packet(self, packet):
         """Add a new packet to storage"""
         packet_time = datetime.now()
+        
+        # Import IPv6 if needed
+        from scapy.layers.inet6 import IPv6
+        
+        # Create a more robust packet data structure that handles various packet types
         packet_data = {
             'time': packet_time,
             'packet': packet,
-            'src': packet[IP].src if IP in packet else "",
-            'dst': packet[IP].dst if IP in packet else "",
+            'src': packet[IP].src if IP in packet else (packet[IPv6].src if IPv6 in packet else "Unknown"),
+            'dst': packet[IP].dst if IP in packet else (packet[IPv6].dst if IPv6 in packet else "Unknown"),
             'protocol': self._get_protocol(packet),
             'length': len(packet),
             'info': self._get_packet_info(packet),
             'modified': False
         }
+        
         self.packets.append(packet_data)
         self._apply_filter()
         return len(self.packets) - 1
         
     def _get_protocol(self, packet):
         """Determine the protocol of the packet"""
-        if TCP in packet:
-            return f"TCP {packet[TCP].sport} → {packet[TCP].dport}"
-        elif UDP in packet:
-            return f"UDP {packet[UDP].sport} → {packet[UDP].dport}"
-        elif IP in packet:
-            return f"IP {packet[IP].proto}"
-        else:
+        from scapy.layers.inet6 import IPv6
+        
+        try:
+            if TCP in packet:
+                return f"TCP {packet[TCP].sport} → {packet[TCP].dport}"
+            elif UDP in packet:
+                return f"UDP {packet[UDP].sport} → {packet[UDP].dport}"
+            elif IP in packet:
+                return f"IP {packet[IP].proto}"
+            elif IPv6 in packet:
+                return f"IPv6 {packet[IPv6].nh}"
+            else:
+                # Try to get a useful summary
+                return packet.summary().split(" / ")[0]
+        except:
             return "Unknown"
     
     def _get_packet_info(self, packet):
         """Extract useful info from the packet"""
-        info = ""
-        if TCP in packet:
-            flags = []
-            if packet[TCP].flags & 0x01: flags.append("F")  # FIN
-            if packet[TCP].flags & 0x02: flags.append("S")  # SYN
-            if packet[TCP].flags & 0x04: flags.append("R")  # RST
-            if packet[TCP].flags & 0x08: flags.append("P")  # PSH
-            if packet[TCP].flags & 0x10: flags.append("A")  # ACK
-            if packet[TCP].flags & 0x20: flags.append("U")  # URG
-            
-            flag_str = "".join(flags)
-            info = f"Seq={packet[TCP].seq} Ack={packet[TCP].ack} Win={packet[TCP].window} [{flag_str}]"
-            
-            # Check for payload data
-            if Raw in packet:
-                data_len = len(packet[Raw])
-                info += f" Len={data_len}"
+        from scapy.layers.inet6 import IPv6
+        
+        try:
+            info = ""
+            if TCP in packet:
+                flags = []
+                if packet[TCP].flags & 0x01: flags.append("F")  # FIN
+                if packet[TCP].flags & 0x02: flags.append("S")  # SYN
+                if packet[TCP].flags & 0x04: flags.append("R")  # RST
+                if packet[TCP].flags & 0x08: flags.append("P")  # PSH
+                if packet[TCP].flags & 0x10: flags.append("A")  # ACK
+                if packet[TCP].flags & 0x20: flags.append("U")  # URG
                 
-        elif UDP in packet:
-            info = f"Len={len(packet[UDP])}"
-            if Raw in packet:
-                data_len = len(packet[Raw])
-                info += f" Data={data_len}"
+                flag_str = "".join(flags)
+                info = f"Seq={packet[TCP].seq} Ack={packet[TCP].ack} Win={packet[TCP].window} [{flag_str}]"
                 
-        return info
+                # Check for payload data
+                if Raw in packet:
+                    data_len = len(packet[Raw])
+                    info += f" Len={data_len}"
+                    
+            elif UDP in packet:
+                info = f"Len={len(packet[UDP])}"
+                if Raw in packet:
+                    data_len = len(packet[Raw])
+                    info += f" Data={data_len}"
+            elif IPv6 in packet:
+                # Handle IPv6 packets
+                info = f"Next Header={packet[IPv6].nh} Hop Limit={packet[IPv6].hlim}"
+                if Raw in packet:
+                    data_len = len(packet[Raw])
+                    info += f" Data={data_len}"
+            else:
+                # For non-TCP/UDP packets, just use summary
+                info = packet.summary()
+                
+            return info
+        except:
+            # If we can't parse packet details, return basic summary
+            try:
+                return packet.summary()
+            except:
+                return "Unknown packet"
         
     def set_filter(self, filter_func):
         """Set a new filter function"""
@@ -316,8 +576,9 @@ class ProcessSelector(QWidget):
         details_group = QGroupBox("Process Details")
         details_layout = QVBoxLayout()
         
-        self.details_label = QLabel("No process selected")
-        self.details_label.setWordWrap(True)  # Allow text wrapping
+        # Replace QLabel with QTextEdit for scrollability
+        self.details_label = QTextEdit()
+        self.details_label.setReadOnly(True)
         self.details_label.setMinimumHeight(100)  # Set minimum height
         self.details_label.setMaximumHeight(150)  # Set maximum height
         details_layout.addWidget(self.details_label)
@@ -471,12 +732,12 @@ class ProcessSelector(QWidget):
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 details += "Could not retrieve network connections (access denied)"
                 
-            self.details_label.setText(details)
+            self.details_label.setHtml(details)
             
             # Emit signal
             self.process_selected.emit(selected_pid)
         else:
-            self.details_label.setText("No process selected")
+            self.details_label.setHtml("No process selected")
             self.process_selected.emit(-1)
 
 class PacketTableWidget(QTableWidget):
@@ -536,6 +797,12 @@ class PacketTableWidget(QTableWidget):
         if packet_data.get('modified', False):
             for col in range(7):
                 self.item(row, col).setBackground(QColor(255, 255, 200))  # Light yellow
+                
+        # Highlight RuneScape packets
+        if packet_data.get('is_rs_packet', False):
+            for col in range(7):
+                self.item(row, col).setBackground(QColor(200, 255, 200))  # Light green
+                self.item(row, col).setForeground(QColor(0, 100, 0))  # Dark green text
         
         # Store packet index
         self.setItem(row, 0, QTableWidgetItem(str(index + 1)))
@@ -959,12 +1226,53 @@ class MainWindow(QMainWindow):
         # Create and start capture thread
         self.capture_thread = PacketCaptureThread(selected_pid)
         self.capture_thread.packet_captured.connect(self.on_packet_captured)
+        self.capture_thread.connections_updated.connect(self.on_connections_updated)
         self.capture_thread.start()
         
         # Update UI
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_bar.showMessage("Capturing packets...")
+        
+    def on_connections_updated(self, connections):
+        """Handle updated connections from the capture thread"""
+        # Get current selected process
+        selected_pid = -1
+        for proc in self.process_selector.processes:
+            if self.process_selector.process_combo.currentData() == proc['pid']:
+                selected_pid = proc['pid']
+                proc_info = proc
+                break
+                
+        if selected_pid <= 0:
+            return
+            
+        # Update the connection details in the UI
+        details = f"<b>Name:</b> {proc_info['name']}<br>"
+        details += f"<b>PID:</b> {proc_info['pid']}<br>"
+        details += f"<b>User:</b> {proc_info['username']}<br>"
+        
+        # Truncate command line if too long
+        cmd = proc_info['cmdline']
+        if len(cmd) > 100:
+            cmd = cmd[:97] + "..."
+        details += f"<b>Command:</b> {cmd}<br><br>"
+        
+        # Add updated network connections
+        if connections:
+            details += "<b>Network Connections:</b><br>"
+            for conn in connections:
+                if conn.laddr and hasattr(conn, 'raddr') and conn.raddr:
+                    details += f"• {conn.laddr.ip}:{conn.laddr.port} → {conn.raddr.ip}:{conn.raddr.port} [{conn.status}]<br>"
+        
+        # Update the UI
+        self.process_selector.details_label.setHtml(details)
+        
+        # Also update the capture filter if the thread is running
+        if self.capture_thread and self.capture_thread.isRunning():
+            new_filter = self.capture_thread.get_filter_string()
+            print(f"Updated filter: {new_filter}")
+            # Note: We don't restart capture here, just update the display
         
     def stop_capture(self):
         """Stop packet capture"""
@@ -979,13 +1287,57 @@ class MainWindow(QMainWindow):
         
     def on_packet_captured(self, packet):
         """Handle captured packet"""
-        # Add to packet manager
-        packet_index = self.packet_manager.add_packet(packet)
+        # Print debug info
+        print(f"Processing captured packet: {packet.summary()}")
         
-        # Update UI
-        packets = self.packet_manager.get_displayed_packets()
-        if packet in [p['packet'] for p in packets]:
-            self.packet_table.add_packet(packet_index, packets[-1])
+        # Add to packet manager
+        try:
+            from scapy.layers.inet import TCP, UDP
+            
+            # Check if this is a RuneScape packet (for highlighting)
+            is_rs_packet = False
+            rs_ports = [43594, 43595, 43596, 43597, 43598, 443, 80]
+            
+            if TCP in packet:
+                if packet[TCP].sport in rs_ports or packet[TCP].dport in rs_ports:
+                    is_rs_packet = True
+                    print(f"Found RuneScape TCP packet: sport={packet[TCP].sport}, dport={packet[TCP].dport}")
+            elif UDP in packet:
+                if packet[UDP].sport in rs_ports or packet[UDP].dport in rs_ports:
+                    is_rs_packet = True
+                    print(f"Found RuneScape UDP packet: sport={packet[UDP].sport}, dport={packet[UDP].dport}")
+            
+            # Add to packet manager
+            packet_index = self.packet_manager.add_packet(packet)
+            
+            # Get the packet data we just added
+            packet_data = self.packet_manager.packets[-1]
+            
+            # Mark RuneScape packets
+            if is_rs_packet:
+                packet_data['is_rs_packet'] = True
+            
+            # Always show all packets in the UI regardless of filters
+            self.packet_table.add_packet(packet_index, packet_data)
+            
+            # Update status
+            self.status_bar.showMessage(f"Captured {len(self.packet_manager.packets)} packets")
+        except Exception as e:
+            print(f"Error processing packet: {e}")
+            # Try to display basic info about the packet
+            row = self.packet_table.rowCount()
+            self.packet_table.insertRow(row)
+            try:
+                time_str = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                self.packet_table.setItem(row, 0, QTableWidgetItem(str(len(self.packet_manager.packets) + 1)))
+                self.packet_table.setItem(row, 1, QTableWidgetItem(time_str))
+                self.packet_table.setItem(row, 2, QTableWidgetItem("Unknown"))
+                self.packet_table.setItem(row, 3, QTableWidgetItem("Unknown"))
+                self.packet_table.setItem(row, 4, QTableWidgetItem("Unknown"))
+                self.packet_table.setItem(row, 5, QTableWidgetItem(str(len(packet))))
+                self.packet_table.setItem(row, 6, QTableWidgetItem(packet.summary()))
+            except:
+                pass
             
     def on_packet_selected(self, packet_index):
         """Handle packet selection in the table"""
@@ -1007,11 +1359,10 @@ class MainWindow(QMainWindow):
     def refresh_packet_table(self):
         """Refresh the packet table with current data"""
         self.packet_table.clear_packets()
-        packets = self.packet_manager.get_displayed_packets()
         
-        for i, packet_data in enumerate(packets):
-            original_index = self.packet_manager.packets.index(packet_data)
-            self.packet_table.add_packet(original_index, packet_data)
+        # Always display ALL packets, regardless of filters
+        for i, packet_data in enumerate(self.packet_manager.packets):
+            self.packet_table.add_packet(i, packet_data)
             
     def clear_packets(self):
         """Clear all captured packets"""
